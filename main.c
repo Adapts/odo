@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
 #include <string.h>
 #include <inttypes.h>
 #include <sys/stat.h>
@@ -32,7 +33,7 @@
 
 #define ODO_VERSION_MAJOR 0
 #define ODO_VERSION_MINOR 2
-#define ODO_VERSION_PATCH 0
+#define ODO_VERSION_PATCH 2
 #define ODO_AUTHOR "Scott Vokes <scott.vokes@atomicobject.com>"
 
 /* Forward references */
@@ -43,8 +44,13 @@ static bool check_format(const char *file);
 static void increment_counter(counter_t *pc, bool print);
 static void set_counter(counter_t *pc, counter_t nv, bool print);
 static void print_as_decimal(counter_t c);
+static void format_counter(counter_t *pc, counter_t v);
 
-static void usage(const char *progname) {
+static const char *progname = NULL;
+
+static void usage(void) {
+    if (progname == NULL) { progname = "odo"; }
+
     fprintf(stderr, "odometer version %u.%u.%u by %s\n",
         ODO_VERSION_MAJOR, ODO_VERSION_MINOR, ODO_VERSION_PATCH,
         ODO_AUTHOR);
@@ -85,7 +91,7 @@ static void parse_args(config_t *cfg, int argc, char **argv) {
             break;
         case 'h':                   /* fall through */
         case '?':                   /* help / bad arg */
-            usage(argv[0]);
+            usage();
         }
     }
 
@@ -93,7 +99,7 @@ static void parse_args(config_t *cfg, int argc, char **argv) {
     argv += optind;
 
     if (argc < 1) {
-        usage(argv[0]);
+        usage();
     } else {
         cfg->path = argv[0];
     }
@@ -120,25 +126,49 @@ static void open_counter_file(config_t *cfg) {
         }
     }
     
-    /* Check file size: should match counter and '\n'. */
+    /* Check file size: should match counter and '\n', or 0. */
     struct stat sbuf;
     if (fstat(fd, &sbuf) == -1) { err(EXIT_FAILURE, "stat"); }
-    if (sbuf.st_size != (sizeof(counter_t) + sizeof(char))) {
+    off_t exp_size = sizeof(counter_t) + sizeof(char);
+    
+    if (sbuf.st_size == 0) {    /* race on counter file initialization */
+        /* monotonically ftruncate, expanding to the right size */
+        if (0 != ftruncate(fd, exp_size)) {
+            err(1, "ftruncate");
+        }
+    } else if (sbuf.st_size == (exp_size)) {
+        /* size is as expected */
+    } else if (sbuf.st_size != (exp_size)) {
         fprintf(stderr,
             "Unexpected size %zd, not a valid counter file.\n",
             (size_t)sbuf.st_size);
         exit(EXIT_FAILURE);
     }
 
-    void *p = mmap(NULL, sizeof(counter_t), PROT_READ | PROT_WRITE,
+    uint8_t *p = mmap(NULL, sizeof(counter_t), PROT_READ | PROT_WRITE,
         MAP_SHARED, fd, 0);
         
     if (p == MAP_FAILED) {
         err(EXIT_FAILURE, "mmap");
-    }
+    } else {
+        /* Set last byte to '\n'; idempotent. */
+        p[exp_size - 1] = '\n';
 
-    cfg->fd = fd;
-    cfg->p = p;
+        counter_t *cur = (counter_t *)&p[0];
+
+        /* If not yet initialized, attempt to CAS from 0 to "0000".
+         * It's fine if another process beats us to it. */
+        while (*cur == 0x0) {
+            counter_t new_string = 0;
+            format_counter(&new_string, 0);
+            if (ATOMIC_BOOL_COMPARE_AND_SWAP(cur, 0, new_string)) {
+                break;
+            }
+        }
+        
+        cfg->fd = fd;
+        cfg->p = p;
+    }
 }
 
 static void close_counter_file(config_t *cfg) {
@@ -162,18 +192,7 @@ static int create_new_counter_file(const char *path) {
         err(EXIT_FAILURE, "open");
     }
 
-    uint8_t counter_txt[sizeof(counter_t) + sizeof(char)];
-    memset(counter_txt, '0', sizeof(counter_txt));
-    /* Add a line break so it cats nicely. */
-    counter_txt[sizeof(counter_t)] = '\n';
-
-    ssize_t res = write(fd, counter_txt, sizeof(counter_txt));
-    if (res == sizeof(counter_txt)) { /* written in full */
-        return fd;
-    } else {
-        err(EXIT_FAILURE, "write");
-        return EXIT_FAILURE;
-    }
+    return fd;
 }
 
 /* Read the current counter, which is a numeric string such as "00001230",
@@ -194,9 +213,13 @@ static void read_current_counter(counter_t *pc, counter_t *val) {
 }
 
 static bool check_format(const char *buf) {
-    if (buf[sizeof(counter_t)] != '\n') { return false; }
+    if (buf[sizeof(counter_t)] != '\n') {
+        return false;
+    }
     for (uint8_t i = 0; i < sizeof(counter_t); i++) {
-        if (!isdigit(buf[i])) { return false; }
+        if (!isdigit(buf[i])) {
+            return false;
+        }
     }
     return true;
 }
@@ -265,6 +288,9 @@ static void print_as_decimal(counter_t c) {
 
 int main(int argc, char **argv) {
     config_t cfg = { .op = OP_INC, };
+
+    /* Grab program name before getopt discards it. */
+    if (argc > 0) { progname = argv[0]; }
 
     parse_args(&cfg, argc, argv);
     open_counter_file(&cfg);
